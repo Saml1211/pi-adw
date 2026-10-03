@@ -63,3 +63,24 @@ assert(skippedRes.reportMarkdown.includes("SKIPPED"), "Markdown report must stat
 console.log("✓ Verification skipped state verified (prevents false-positive test passes)");
 
 console.log("\nALL TESTS PASSED! pi-adw is fully hardened.");
+
+// Regression checks for the verification gate
+{
+  const { executeAdwPipeline } = await import("./index.ts");
+  const assert = (await import("node:assert")).default;
+  delete process.env.TYPESAFE_API_KEY;
+  let compactCalls = 0;
+  const hotCtx: any = { compact: () => compactCalls++, getContextUsage: () => ({ tokens: 99000, contextWindow: 100000, percent: 99 }), ui: { notify: () => {} } };
+  // never compacts (ctx.compact aborts the run and would discard the report)
+  const big = await executeAdwPipeline("g", { verifyCommand: `node -e "process.stdout.write('x'.repeat(3*1024*1024))"` }, process.cwd(), hotCtx);
+  assert.equal(compactCalls, 0, "adw must never call ctx.compact");
+  assert.equal(big.testStatus, "pass", "3 MB of output must not be a false fail (old 1 MB maxBuffer)");
+  const failed = await executeAdwPipeline("g", { verifyCommand: `node -e "console.error('boom'); process.exit(3)"` }, process.cwd(), hotCtx);
+  assert.equal(failed.testStatus, "fail");
+  assert.match(failed.reportMarkdown, /boom/);
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 200);
+  const aborted = await executeAdwPipeline("g", { verifyCommand: `node -e "setTimeout(()=>{}, 10000)"` }, process.cwd(), hotCtx, ac.signal);
+  assert.equal(aborted.testStatus, "fail", "aborted verification must not report pass");
+  console.log("✓ no compaction, 3 MB output passes, failure + abort reported as fail");
+}

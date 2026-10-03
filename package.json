@@ -1,7 +1,7 @@
 {
   "name": "pi-adw",
-  "version": "1.0.1",
-  "description": "Deterministic AI Developer Workflow (ADW) Software Factory Engine for Pi Coding Agent",
+  "version": "1.1.0",
+  "description": "Verification gate for Pi: Jev scope/risk, tests, diff stat, review readiness",
   "main": "index.ts",
   "scripts": {
     "test": "bun run test.ts"

@@ -1,7 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { exec, execSync } from "node:child_process";
+import { promisify } from "node:util";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -10,6 +11,8 @@ import { Type } from "@sinclair/typebox";
 
 const JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const JEV_MODEL = "jev-latest";
+const execAsync = promisify(exec);
+const VERIFY_TIMEOUT_MS = Number(process.env.PI_ADW_VERIFY_TIMEOUT_MS) > 0 ? Number(process.env.PI_ADW_VERIFY_TIMEOUT_MS) : 300_000;
 
 function resolveJevApiKey(): string | undefined {
   if (process.env.TYPESAFE_API_KEY?.trim()) {
@@ -33,7 +36,6 @@ function resolveJevApiKey(): string | undefined {
 
 export interface AdwPipelineOptions {
   verifyCommand?: string;
-  autoCompactAtPct?: number;
 }
 
 export interface AdwPipelineResult {
@@ -154,28 +156,22 @@ export async function executeAdwPipeline(
   const branch = safeExec("git branch --show-current || git rev-parse --abbrev-ref HEAD", cwd) || "unknown";
   const verifyCmd = opts.verifyCommand || detectVerificationCommand(cwd);
 
-  // 3. Context Watchdog Check
-  const usage = ctx?.getContextUsage?.();
-  const pct = usage?.percent ?? 0;
-  let compacted = false;
-  const compactThreshold = opts.autoCompactAtPct || 75;
-  if (pct >= compactThreshold && ctx?.compact) {
-    ctx.compact({
-      customInstructions: `ADW WORKFLOW CHECKPOINT:\nGoal: ${goal}\nScope: ${scopeSize}\nBranch: ${branch}`,
-    });
-    compacted = true;
-  }
+  // No compaction here: ctx.compact() aborts the running agent, which would discard this
+  // tool's report and stall the run. Context management belongs to self-compact.
 
-  // 4. Verification Phase (Strict 3-state logic: pass | fail | skipped)
+  // 3. Verification (pass | fail | skipped). verifyCmd is a shell command string by design
+  // ("npm test", "cargo test"), the same trust level as the agent's own bash tool.
   let testStatus: "pass" | "fail" | "skipped" = "skipped";
   let testOutput = "";
   if (verifyCmd) {
     try {
-      testOutput = execSync(verifyCmd, { cwd, encoding: "utf8", timeout: 20000 });
+      // async so a long suite does not freeze Pi's event loop/UI; 10 MB so verbose output is not a false fail
+      const { stdout } = await execAsync(verifyCmd, { cwd, encoding: "utf8", timeout: VERIFY_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024, signal: effectiveSignal });
+      testOutput = stdout;
       testStatus = "pass";
     } catch (err: any) {
       testStatus = "fail";
-      testOutput = err.stderr || err.stdout || err.message;
+      testOutput = err.killed ? `Timed out or aborted after ${VERIFY_TIMEOUT_MS / 1000}s\n${err.stdout ?? ""}` : err.stderr || err.stdout || err.message;
     }
   }
 
@@ -240,9 +236,6 @@ export async function executeAdwPipeline(
   if (jevReadiness !== undefined) {
     sections.push(`- **Jev Readiness Score:** ${Math.round(jevReadiness * 100)}% confidence`);
   }
-  if (compacted) {
-    sections.push(`- **Context Maintenance:** Self-compaction triggered at ${pct}% token pressure`);
-  }
 
   sections.push(`\n**Diff Stat:**\n\`\`\`\n${diffSummary}\n\`\`\``);
 
@@ -265,17 +258,14 @@ export default function (pi: ExtensionAPI) {
   // 1. Tool: adw (conforming to Pi's 5-argument execute signature)
   pi.registerTool({
     name: "adw",
-    label: "AI Developer Workflow Engine",
+    label: "ADW Verification Gate",
     description:
-      "Autonomous 5-phase execution loop (Prime -> Plan -> Build -> Checkpoint -> Verify). Coordinates dynamic context priming, auto-validation, and self-compaction with TypeSafe Jev quality gates.",
-    promptSnippet: "Use adw to run a structured software factory cycle against an implementation or bug-fix goal.",
+      "Preflight/verification gate for a goal: TypeSafe Jev scope & risk classification, runs the verify command (auto-detected from package.json / Cargo.toml / pytest if omitted), reports staged+unstaged diff stat and a Jev review-readiness score. It does not plan or edit code.",
+    promptSnippet: "Use adw before declaring a goal done: it runs the tests and scores review readiness.",
     parameters: Type.Object({
       goal: Type.String({ description: "The feature, bug fix, or refactor goal to execute" }),
       verifyCommand: Type.Optional(
         Type.String({ description: "Optional test verification command (auto-detected if omitted)" }),
-      ),
-      autoCompactAtPct: Type.Optional(
-        Type.Number({ description: "Context usage threshold (default: 75%) to trigger self-compaction" }),
       ),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
@@ -285,7 +275,7 @@ export default function (pi: ExtensionAPI) {
       effectiveCtx?.ui?.notify?.(`[pi-adw] Initiating software factory cycle: "${params.goal.slice(0, 35)}..."`, "info");
       const result = await executeAdwPipeline(
         params.goal,
-        { verifyCommand: params.verifyCommand, autoCompactAtPct: params.autoCompactAtPct },
+        { verifyCommand: params.verifyCommand },
         effectiveCtx?.cwd || process.cwd(),
         effectiveCtx,
         effectiveSignal,
@@ -299,7 +289,7 @@ export default function (pi: ExtensionAPI) {
 
   // 2. Slash Command: /adw <goal>
   pi.registerCommand("adw", {
-    description: "Run an AI Developer Workflow (ADW) cycle against a goal",
+    description: "Run the ADW verification gate (Jev scope, tests, diff stat, readiness) against a goal",
     handler: async (args, ctx) => {
       const goal = args?.trim();
       if (!goal) {
@@ -313,6 +303,8 @@ export default function (pi: ExtensionAPI) {
         `[pi-adw] Cycle finished: ${result.testStatus} (${result.scopeSize})`,
         result.testStatus === "fail" ? "error" : "info",
       );
+      // The full report was previously dropped; put it in the transcript (no new turn).
+      pi.sendMessage({ customType: "adw-report", content: result.reportMarkdown, display: true });
     },
   });
 }

@@ -1,24 +1,25 @@
 # pi-adw
 
-Autonomous AI Developer Workflow (ADW) Software Factory engine for the **Pi Coding Agent**, inspired by Dan Disler's ([IndyDevDan](https://github.com/disler)) *FORGET Loop Engineering: Agentic Engineering is About THIS*.
+A verification gate for the [Pi coding agent](https://github.com/earendil-works/pi), named after the AI Developer Workflow (ADW) idea from Dan Disler ([IndyDevDan](https://github.com/disler)). Call it before declaring a goal done.
 
-## Overview
+It does **not** plan or edit code. In one call it:
 
-Rather than running unconstrained prompt loops ("vibe coding"), `pi-adw` coordinates the estate's new agentic primitives into a structured 5-phase software factory:
+1. Classifies the goal's scope and risk with TypeSafe Jev, if `TYPESAFE_API_KEY` or `~/.pi/agent/pi-jev.json` is set.
+2. Runs the verify command. If you don't give one, it is detected from `package.json` (`bun run test` for Bun projects), `Cargo.toml` or pytest config. The result is `pass`, `fail` or `skipped`, never a false `pass`.
+3. Reports the staged and unstaged diff stat.
+4. Scores review readiness with Jev.
 
-1. **Prime & Scope:** Detects repo stack, dirty files, and runs TypeSafe Jev scope & risk classification.
-2. **Plan:** Enforces lazy senior dev constraints (stdlib-first, smallest diff).
-3. **Build:** Changes applied with `pi-auto-validate` deterministically catching syntax errors in real-time.
-4. **Checkpoint:** Evaluates context pressure; triggers `self_compact` if usage crosses threshold (75%).
-5. **Verify:** Runs test suites; provides diff stat and Jev readiness score.
+The command runs asynchronously, so Pi stays responsive. It has a 10 MB output buffer, a 300 s timeout (`PI_ADW_VERIFY_TIMEOUT_MS`), and honours the tool's abort signal. It never compacts context: `ctx.compact()` aborts the running agent, and context management belongs to [self-compact-pi-agent](https://github.com/Saml1211/self-compact-pi-agent).
 
-## Tool & Command
+## Usage
 
-- Tool: `adw(goal, verifyCommand?, autoCompactAtPct?)`
-- Command: `/adw <goal description>`
+- Tool: `adw(goal, verifyCommand?)`
+- Command: `/adw <goal>` (the report is added to the transcript)
+
+`verifyCommand` is a shell string such as `npm test`, at the same trust level as the agent's own bash tool.
 
 ## Verification
 
 ```bash
-node --input-type=module test.ts
+bun run test.ts
 ```
