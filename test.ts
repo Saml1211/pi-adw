@@ -84,3 +84,25 @@ console.log("\nALL TESTS PASSED! pi-adw is fully hardened.");
   assert.equal(aborted.testStatus, "fail", "aborted verification must not report pass");
   console.log("✓ no compaction, 3 MB output passes, failure + abort reported as fail");
 }
+
+// Process control: TERM-ignoring command must not pass after timeout; descendants die on abort
+{
+  const { executeAdwPipeline } = await import("./index.ts");
+  const assert = (await import("node:assert")).default;
+  const cp = await import("node:child_process");
+  const pg = (pat: string) => { try { return cp.execFileSync("pgrep", ["-f", pat], { encoding: "utf8" }).trim(); } catch { return ""; } };
+  const { runBounded } = await import("./index.ts");
+  const t0 = Date.now();
+  const stubborn = await runBounded("trap '' TERM; sleep 3.7", { cwd: process.cwd(), timeoutMs: 300 });
+  assert.equal(stubborn.timedOut, true);
+  assert.ok(Date.now() - t0 < 3000, "killed by SIGKILL escalation, not left to finish");
+  assert.equal(pg("sleep 3.7"), "", "no straggler after timeout");
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 200);
+  const hot: any = { getContextUsage: () => undefined, ui: { notify: () => {} } };
+  const ab = await executeAdwPipeline("g", { verifyCommand: "sleep 6.1 & sleep 6.2; wait" }, process.cwd(), hot, ac.signal);
+  assert.equal(ab.testStatus, "fail");
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(pg("sleep 6.1") + pg("sleep 6.2"), "", "abort kills background descendants too");
+  console.log("✓ TERM-ignoring command times out (never passes), abort kills the process group");
+}

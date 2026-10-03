@@ -9,7 +9,7 @@ It does **not** plan or edit code. In one call it:
 3. Reports the staged and unstaged diff stat.
 4. Scores review readiness with Jev.
 
-The command runs asynchronously, so Pi stays responsive. It has a 10 MB output buffer, a 300 s timeout (`PI_ADW_VERIFY_TIMEOUT_MS`), and honours the tool's abort signal. It never compacts context: `ctx.compact()` aborts the running agent, and context management belongs to [self-compact-pi-agent](https://github.com/Saml1211/self-compact-pi-agent).
+The command runs asynchronously in its own process group, so Pi stays responsive. Output is capped at 10 MB, and the timeout is 300 s (`PI_ADW_VERIFY_TIMEOUT_MS`). On timeout or abort the whole group gets SIGTERM, then SIGKILL after 2 s, and a timed-out or aborted run is always `fail`. It never compacts context: `ctx.compact()` aborts the running agent, and context management belongs to [self-compact-pi-agent](https://github.com/Saml1211/self-compact-pi-agent).
 
 ## Usage
 

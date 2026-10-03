@@ -1,8 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
-import { exec, execSync } from "node:child_process";
-import { promisify } from "node:util";
+import { execSync, spawn } from "node:child_process";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -11,7 +10,6 @@ import { Type } from "@sinclair/typebox";
 
 const JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const JEV_MODEL = "jev-latest";
-const execAsync = promisify(exec);
 const VERIFY_TIMEOUT_MS = Number(process.env.PI_ADW_VERIFY_TIMEOUT_MS) > 0 ? Number(process.env.PI_ADW_VERIFY_TIMEOUT_MS) : 300_000;
 
 function resolveJevApiKey(): string | undefined {
@@ -131,6 +129,37 @@ export function detectVerificationCommand(cwd: string): string | undefined {
   return undefined;
 }
 
+export interface BoundedResult { code: number | null; out: string; timedOut: boolean; aborted: boolean }
+
+// Run a shell command in its own process group; on timeout/abort kill the WHOLE group (TERM, then
+// KILL after 2 s), so descendants can't outlive it and a timed-out command can never count as a pass.
+// ponytail: duplicated from pi-cmux-race (separate repos); a process that calls setsid escapes the group.
+export function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; signal?: AbortSignal; maxBytes?: number }): Promise<BoundedResult> {
+  return new Promise((resolve) => {
+    const child = spawn("bash", ["-c", cmd], { cwd: o.cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const max = o.maxBytes ?? 10 * 1024 * 1024;
+    let out = "";
+    const add = (b: Buffer) => { if (out.length < max) out += b.toString(); };
+    child.stdout!.on("data", add);
+    child.stderr!.on("data", add);
+    let timedOut = false, aborted = false, killTimer: NodeJS.Timeout | undefined;
+    const group = (sig: NodeJS.Signals) => { try { process.kill(-child.pid!, sig); } catch {} };
+    const stop = () => { group("SIGTERM"); killTimer ??= setTimeout(() => group("SIGKILL"), 2000); };
+    const timer = setTimeout(() => { timedOut = true; stop(); }, Math.max(1, o.timeoutMs));
+    const onAbort = () => { aborted = true; stop(); };
+    if (o.signal?.aborted) onAbort();
+    else o.signal?.addEventListener("abort", onAbort, { once: true });
+    child.on("error", (e) => { out += String(e); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (killTimer) { clearTimeout(killTimer); group("SIGKILL"); } // sweep stragglers still in the group
+      o.signal?.removeEventListener("abort", onAbort);
+      resolve({ code, out, timedOut, aborted });
+    });
+  });
+}
+
+
 export async function executeAdwPipeline(
   goal: string,
   opts: AdwPipelineOptions = {},
@@ -164,15 +193,15 @@ export async function executeAdwPipeline(
   let testStatus: "pass" | "fail" | "skipped" = "skipped";
   let testOutput = "";
   if (verifyCmd) {
-    try {
-      // async so a long suite does not freeze Pi's event loop/UI; 10 MB so verbose output is not a false fail
-      const { stdout } = await execAsync(verifyCmd, { cwd, encoding: "utf8", timeout: VERIFY_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024, signal: effectiveSignal });
-      testOutput = stdout;
-      testStatus = "pass";
-    } catch (err: any) {
-      testStatus = "fail";
-      testOutput = err.killed ? `Timed out or aborted after ${VERIFY_TIMEOUT_MS / 1000}s\n${err.stdout ?? ""}` : err.stderr || err.stdout || err.message;
-    }
+    // async (Pi stays responsive); own process group so timeout/abort kills descendants too.
+    // Timeout and abort are tracked independently of the exit code: neither can ever be a pass.
+    const r = await runBounded(verifyCmd, { cwd, timeoutMs: VERIFY_TIMEOUT_MS, signal: effectiveSignal });
+    testStatus = r.code === 0 && !r.timedOut && !r.aborted ? "pass" : "fail";
+    testOutput = r.timedOut
+      ? `Timed out after ${VERIFY_TIMEOUT_MS / 1000}s (process group killed)\n${r.out}`
+      : r.aborted
+      ? `Aborted (process group killed)\n${r.out}`
+      : r.out;
   }
 
   // 5. Harvest & Diff Summary (both staged and unstaged)
