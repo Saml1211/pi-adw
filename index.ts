@@ -129,36 +129,60 @@ export function detectVerificationCommand(cwd: string): string | undefined {
   return undefined;
 }
 
-export interface BoundedResult { code: number | null; out: string; timedOut: boolean; aborted: boolean }
+export interface BoundedResult { code: number | null; out: string; timedOut: boolean; aborted: boolean; escaped: boolean }
 
 // Run a shell command in its own process group; on timeout/abort kill the WHOLE group (TERM, then
 // KILL after 2 s), so descendants can't outlive it and a timed-out command can never count as a pass.
-// ponytail: duplicated from pi-cmux-race (separate repos); a process that calls setsid escapes the group.
+// A descendant that left the group (setsid) and holds our pipes would block 'close' forever, so the
+// call also settles 5 s after the first kill signal no matter what, closing its pipes and reporting escaped: true.
+// ponytail: duplicated from pi-cmux-race (separate repos); setsid escapees are reported, not hunted down.
 export function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; signal?: AbortSignal; maxBytes?: number }): Promise<BoundedResult> {
   return new Promise((resolve) => {
     const child = spawn("bash", ["-c", cmd], { cwd: o.cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     const max = o.maxBytes ?? 10 * 1024 * 1024;
-    let out = "";
-    const add = (b: Buffer) => { if (out.length < max) out += b.toString(); };
+    const chunks: Buffer[] = [];
+    let bytes = 0, truncated = false;
+    const add = (b: Buffer) => {
+      const room = max - bytes;
+      if (room <= 0) { truncated = true; return; }
+      const part = b.length > room ? b.subarray(0, room) : b;
+      if (part.length < b.length) truncated = true;
+      chunks.push(part);
+      bytes += part.length;
+    };
     child.stdout!.on("data", add);
     child.stderr!.on("data", add);
-    let timedOut = false, aborted = false, killTimer: NodeJS.Timeout | undefined;
+    let timedOut = false, aborted = false, escaped = false, done = false;
+    let killTimer: NodeJS.Timeout | undefined, settleTimer: NodeJS.Timeout | undefined;
     const group = (sig: NodeJS.Signals) => { try { process.kill(-child.pid!, sig); } catch {} };
-    const stop = () => { group("SIGTERM"); killTimer ??= setTimeout(() => group("SIGKILL"), 2000); };
+    const finish = (code: number | null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (killTimer) { clearTimeout(killTimer); group("SIGKILL"); } // sweep stragglers still in the group
+      clearTimeout(settleTimer);
+      o.signal?.removeEventListener("abort", onAbort);
+      const out = Buffer.concat(chunks).toString("utf8") + (truncated ? "\n… (output truncated)" : "");
+      resolve({ code, out, timedOut, aborted, escaped });
+    };
+    const stop = () => {
+      group("SIGTERM");
+      killTimer ??= setTimeout(() => group("SIGKILL"), 2000);
+      settleTimer ??= setTimeout(() => {
+        escaped = true;
+        child.stdout!.destroy();
+        child.stderr!.destroy();
+        finish(child.exitCode);
+      }, 5000);
+    };
     const timer = setTimeout(() => { timedOut = true; stop(); }, Math.max(1, o.timeoutMs));
     const onAbort = () => { aborted = true; stop(); };
     if (o.signal?.aborted) onAbort();
     else o.signal?.addEventListener("abort", onAbort, { once: true });
-    child.on("error", (e) => { out += String(e); });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (killTimer) { clearTimeout(killTimer); group("SIGKILL"); } // sweep stragglers still in the group
-      o.signal?.removeEventListener("abort", onAbort);
-      resolve({ code, out, timedOut, aborted });
-    });
+    child.on("error", (e) => { chunks.push(Buffer.from(String(e))); });
+    child.on("close", (code) => finish(code));
   });
 }
-
 
 export async function executeAdwPipeline(
   goal: string,
@@ -198,7 +222,7 @@ export async function executeAdwPipeline(
     const r = await runBounded(verifyCmd, { cwd, timeoutMs: VERIFY_TIMEOUT_MS, signal: effectiveSignal });
     testStatus = r.code === 0 && !r.timedOut && !r.aborted ? "pass" : "fail";
     testOutput = r.timedOut
-      ? `Timed out after ${VERIFY_TIMEOUT_MS / 1000}s (process group killed)\n${r.out}`
+      ? `Timed out after ${VERIFY_TIMEOUT_MS / 1000}s (process group killed${r.escaped ? "; a descendant escaped the group and may still run" : ""})\n${r.out}`
       : r.aborted
       ? `Aborted (process group killed)\n${r.out}`
       : r.out;

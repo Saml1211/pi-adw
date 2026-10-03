@@ -106,3 +106,16 @@ console.log("\nALL TESTS PASSED! pi-adw is fully hardened.");
   assert.equal(pg("sleep 6.1") + pg("sleep 6.2"), "", "abort kills background descendants too");
   console.log("✓ TERM-ignoring command times out (never passes), abort kills the process group");
 }
+
+// A setsid escapee holding the pipes must not hang verification (final re-review)
+{
+  const { runBounded } = await import("./index.ts");
+  const assert = (await import("node:assert")).default;
+  const cp = await import("node:child_process");
+  const t0 = Date.now();
+  const r = await runBounded("python3 -c 'import os,time; os.setsid(); time.sleep(8.8)' & true", { cwd: process.cwd(), timeoutMs: 200 });
+  try { cp.execFileSync("pkill", ["-f", "time.sleep\\(8.8\\)"]); } catch {}
+  assert.ok(Date.now() - t0 < 6500, "must settle despite an escaped pipe holder");
+  assert.ok(r.timedOut && r.escaped);
+  console.log("✓ setsid escapee: verification settles and reports the escape");
+}
