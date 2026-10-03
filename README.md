@@ -23,3 +23,5 @@ The command runs asynchronously in its own process group, so Pi stays responsive
 ```bash
 bun run test.ts
 ```
+
+**Windows:** `runBounded` runs verify commands in Pi's configured bash (settings.json `shellPath`, else Git Bash; WSL's `bash.exe` is refused with a clear error), kills the process tree with `taskkill /F /T`, and does not detect stray background processes.
