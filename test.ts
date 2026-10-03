@@ -132,3 +132,19 @@ console.log("\nALL TESTS PASSED! pi-adw is fully hardened.");
   assert.ok(r.timedOut && r.escaped);
   console.log("✓ setsid escapee: verification settles and reports the escape");
 }
+
+// A command that exits but leaves a background child with closed pipes: the child is killed and reported
+{
+  const { runBounded } = await import("./index.ts");
+  const { mkdtempSync, readFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const pidf = join(mkdtempSync(join(tmpdir(), "adw-stray-")), "child.pid");
+  const r = await runBounded(`python3 -c 'import os,sys,time; open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(27.7)' '${pidf}' >/dev/null 2>&1 & sleep 0.3; true`, { cwd: tmpdir(), timeoutMs: 10000 });
+  const pid = Number(readFileSync(pidf, "utf8"));
+  let alive = true;
+  try { process.kill(pid, 0); } catch { alive = false; }
+  if (alive) process.kill(pid, "SIGKILL");
+  assert.ok(!alive && r.strays && r.code === 0 && !r.timedOut, JSON.stringify({ alive, ...r }));
+  console.log("✓ closed-pipe background child: killed, reported as strays");
+}

@@ -129,13 +129,15 @@ export function detectVerificationCommand(cwd: string): string | undefined {
   return undefined;
 }
 
-export interface BoundedResult { code: number | null; out: string; timedOut: boolean; aborted: boolean; escaped: boolean }
+export interface BoundedResult { code: number | null; out: string; timedOut: boolean; aborted: boolean; escaped: boolean; strays: boolean }
 const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } };
 
 // Run a shell command in its own process group; on timeout/abort kill the WHOLE group (TERM, then
 // KILL after 2 s), so descendants can't outlive it and a timed-out command can never count as a pass.
 // A descendant that left the group (setsid) and holds our pipes would block 'close' forever, so the
 // call also settles 5 s after the first kill signal no matter what, closing its pipes and reporting escaped: true.
+// A command that exits normally but leaves background processes in its group (pipes closed, so 'close'
+// still fires) has them killed too, reported as strays: true.
 // ponytail: duplicated from pi-cmux-race (separate repos); setsid escapees are reported, not hunted down.
 export function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; signal?: AbortSignal; maxBytes?: number }): Promise<BoundedResult> {
   return new Promise((resolve) => {
@@ -166,11 +168,16 @@ export function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; sig
       if (done) return;
       done = true;
       clearTimeout(timer);
-      if (killTimer) { clearTimeout(killTimer); group("SIGKILL"); } // sweep stragglers still in the group
       clearTimeout(settleTimer);
       o.signal?.removeEventListener("abort", onAbort);
+      // Members left in the group: the id cannot be reused while they live, so it is still ours.
+      const strays = !killTimer && groupAlive(child.pid!);
+      if (killTimer) { clearTimeout(killTimer); group("SIGKILL"); } // sweep stragglers still in the group
       const out = Buffer.concat(chunks).toString("utf8") + (truncated ? "\n… (output truncated)" : "");
-      resolve({ code, out, timedOut, aborted, escaped });
+      const result = { code, out, timedOut, aborted, escaped, strays };
+      if (!strays) return resolve(result);
+      group("SIGTERM");
+      setTimeout(() => { group("SIGKILL"); resolve(result); }, 500);
     };
     const stop = () => {
       group("SIGTERM");
@@ -190,6 +197,8 @@ export function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; sig
     child.on("close", (code) => finish(code));
   });
 }
+
+const groupAlive = (pgid: number) => { try { process.kill(-pgid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } };
 
 export async function executeAdwPipeline(
   goal: string,
@@ -235,6 +244,8 @@ export async function executeAdwPipeline(
       ? `Timed out after ${VERIFY_TIMEOUT_MS / 1000}s (process group killed${escaped})\n${tail}`
       : r.aborted
       ? `Aborted (process group killed${escaped})\n${tail}`
+      : r.strays
+      ? `(the command left background processes behind; they were killed)\n${tail}`
       : tail;
   }
 
