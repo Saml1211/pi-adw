@@ -40,7 +40,7 @@ export interface AdwPipelineResult {
   goal: string;
   scopeSize: string;
   riskLevel: number;
-  testPassed: boolean;
+  testStatus: "pass" | "fail" | "skipped";
   diffSummary: string;
   jevReadiness?: number;
   reportMarkdown: string;
@@ -94,10 +94,14 @@ export async function runAdwScopeCheck(
     const answers = json?.answers;
     if (!answers) return null;
 
-    return {
-      scopeSize: answers.scope_size?.choice ?? "small_fix",
-      riskLevel: answers.risk_level?.noul ?? 0.2,
-    };
+    const allowedScopes = ["small_fix", "medium_feature", "large_refactor"];
+    const scopeRaw = answers.scope_size?.choice;
+    const scopeSize = allowedScopes.includes(scopeRaw) ? scopeRaw : "small_fix";
+
+    const riskRaw = answers.risk_level?.noul;
+    const riskLevel = typeof riskRaw === "number" && Number.isFinite(riskRaw) ? riskRaw : 0.2;
+
+    return { scopeSize, riskLevel };
   } catch {
     return null;
   } finally {
@@ -112,7 +116,7 @@ export function detectVerificationCommand(cwd: string): string | undefined {
       const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
       if (pkg.scripts?.test) {
         if (existsSync(join(cwd, "bun.lock")) || existsSync(join(cwd, "bun.lockb"))) {
-          return "bun test";
+          return "bun run test";
         }
         return "npm test";
       }
@@ -130,14 +134,16 @@ export async function executeAdwPipeline(
   opts: AdwPipelineOptions = {},
   cwd = process.cwd(),
   ctx?: ExtensionContext,
+  signal?: AbortSignal,
 ): Promise<AdwPipelineResult> {
   const apiKey = resolveJevApiKey();
+  const effectiveSignal = signal || ctx?.signal;
 
   // 1. Prime & Scope Phase
   let scopeSize = "small_fix";
   let riskLevel = 0.2;
   if (apiKey) {
-    const scope = await runAdwScopeCheck(goal, apiKey, ctx?.signal);
+    const scope = await runAdwScopeCheck(goal, apiKey, effectiveSignal);
     if (scope) {
       scopeSize = scope.scopeSize;
       riskLevel = scope.riskLevel;
@@ -145,7 +151,7 @@ export async function executeAdwPipeline(
   }
 
   // 2. Planning (Ponytail Senior Dev Constraints)
-  const branch = safeExec("git rev-parse --abbrev-ref HEAD", cwd) || "unknown";
+  const branch = safeExec("git branch --show-current || git rev-parse --abbrev-ref HEAD", cwd) || "unknown";
   const verifyCmd = opts.verifyCommand || detectVerificationCommand(cwd);
 
   // 3. Context Watchdog Check
@@ -160,28 +166,35 @@ export async function executeAdwPipeline(
     compacted = true;
   }
 
-  // 4. Verification Phase
-  let testPassed = true;
+  // 4. Verification Phase (Strict 3-state logic: pass | fail | skipped)
+  let testStatus: "pass" | "fail" | "skipped" = "skipped";
   let testOutput = "";
   if (verifyCmd) {
     try {
       testOutput = execSync(verifyCmd, { cwd, encoding: "utf8", timeout: 20000 });
-      testPassed = true;
+      testStatus = "pass";
     } catch (err: any) {
-      testPassed = false;
+      testStatus = "fail";
       testOutput = err.stderr || err.stdout || err.message;
     }
   }
 
-  // 5. Harvest & Diff Summary
-  const diffSummary = safeExec("git diff --stat", cwd) || "No unstaged diffs";
+  // 5. Harvest & Diff Summary (both staged and unstaged)
+  const unstaged = safeExec("git diff --stat", cwd);
+  const staged = safeExec("git diff --cached --stat", cwd);
+  const diffParts: string[] = [];
+  if (staged) diffParts.push(`Staged:\n${staged}`);
+  if (unstaged) diffParts.push(`Unstaged:\n${unstaged}`);
+  const diffSummary = diffParts.join("\n\n") || "No git changes detected";
 
   // 6. TypeSafe Jev Readiness Check
   let jevReadiness: number | undefined;
   if (apiKey) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
     try {
       const body = {
-        state: `Goal: ${goal}\nTests passed: ${testPassed}\nDiff: ${diffSummary.slice(0, 1000)}`,
+        state: `Goal: ${goal}\nVerification: ${testStatus}\nDiff: ${diffSummary.slice(0, 1000)}`,
         model: JEV_MODEL,
         questions: {
           ready_for_review: {
@@ -194,20 +207,34 @@ export async function executeAdwPipeline(
         method: "POST",
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        signal: effectiveSignal ? AbortSignal.any([controller.signal, effectiveSignal]) : controller.signal,
       });
       if (res.ok) {
         const json = (await res.json()) as any;
-        jevReadiness = json?.answers?.ready_for_review?.noul ?? 0.8;
+        const noul = json?.answers?.ready_for_review?.noul;
+        if (typeof noul === "number" && Number.isFinite(noul)) {
+          jevReadiness = noul;
+        }
       }
-    } catch {}
+    } catch {
+    } finally {
+      clearTimeout(timer);
+    }
   }
+
+  const statusLabel =
+    testStatus === "pass"
+      ? "✅ PASS"
+      : testStatus === "fail"
+      ? "❌ FAIL"
+      : "⚠️ SKIPPED (No test runner detected)";
 
   const sections: string[] = [
     `### 🏭 AI Developer Workflow (ADW) Report`,
     `- **Goal:** ${goal}`,
     `- **Scope Classification:** \`${scopeSize}\` | **Risk Level:** ${Math.round(riskLevel * 100)}%`,
     `- **Branch:** \`${branch}\``,
-    `- **Verification (${verifyCmd || "none"}):** ${testPassed ? "✅ PASS" : "❌ FAIL"}`,
+    `- **Verification (${verifyCmd || "none"}):** ${statusLabel}`,
   ];
 
   if (jevReadiness !== undefined) {
@@ -219,7 +246,7 @@ export async function executeAdwPipeline(
 
   sections.push(`\n**Diff Stat:**\n\`\`\`\n${diffSummary}\n\`\`\``);
 
-  if (!testPassed && testOutput) {
+  if (testStatus === "fail" && testOutput) {
     sections.push(`\n**Test Failures:**\n\`\`\`\n${testOutput.slice(-1500)}\n\`\`\``);
   }
 
@@ -227,7 +254,7 @@ export async function executeAdwPipeline(
     goal,
     scopeSize,
     riskLevel,
-    testPassed,
+    testStatus,
     diffSummary,
     jevReadiness,
     reportMarkdown: sections.join("\n"),
@@ -235,7 +262,7 @@ export async function executeAdwPipeline(
 }
 
 export default function (pi: ExtensionAPI) {
-  // 1. Tool: adw
+  // 1. Tool: adw (conforming to Pi's 5-argument execute signature)
   pi.registerTool({
     name: "adw",
     label: "AI Developer Workflow Engine",
@@ -251,13 +278,17 @@ export default function (pi: ExtensionAPI) {
         Type.Number({ description: "Context usage threshold (default: 75%) to trigger self-compaction" }),
       ),
     }),
-    async execute(_id, params, ctx: ExtensionContext) {
-      ctx.ui?.notify?.(`[pi-adw] Initiating software factory cycle: "${params.goal.slice(0, 35)}..."`, "info");
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const effectiveCtx: ExtensionContext | undefined = ctx || (signal && (signal as any).cwd ? (signal as any) : undefined);
+      const effectiveSignal: AbortSignal | undefined = signal instanceof AbortSignal ? signal : effectiveCtx?.signal;
+
+      effectiveCtx?.ui?.notify?.(`[pi-adw] Initiating software factory cycle: "${params.goal.slice(0, 35)}..."`, "info");
       const result = await executeAdwPipeline(
         params.goal,
         { verifyCommand: params.verifyCommand, autoCompactAtPct: params.autoCompactAtPct },
-        ctx.cwd || process.cwd(),
-        ctx,
+        effectiveCtx?.cwd || process.cwd(),
+        effectiveCtx,
+        effectiveSignal,
       );
 
       return {
@@ -279,8 +310,8 @@ export default function (pi: ExtensionAPI) {
       ctx.ui?.notify?.(`[pi-adw] Running ADW cycle for: ${goal}`, "info");
       const result = await executeAdwPipeline(goal, {}, ctx.cwd || process.cwd(), ctx);
       ctx.ui?.notify?.(
-        `[pi-adw] Cycle finished: ${result.testPassed ? "Tests passed" : "Tests failed"} (${result.scopeSize})`,
-        result.testPassed ? "info" : "error",
+        `[pi-adw] Cycle finished: ${result.testStatus} (${result.scopeSize})`,
+        result.testStatus === "fail" ? "error" : "info",
       );
     },
   });

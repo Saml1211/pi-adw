@@ -1,10 +1,10 @@
 {
   "name": "pi-adw",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Deterministic AI Developer Workflow (ADW) Software Factory Engine for Pi Coding Agent",
   "main": "index.ts",
   "scripts": {
-    "test": "node --input-type=module test.ts"
+    "test": "bun run test.ts"
   },
   "keywords": [
     "pi-extension",
