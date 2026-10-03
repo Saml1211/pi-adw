@@ -1,0 +1,24 @@
+{
+  "name": "pi-adw",
+  "version": "1.0.0",
+  "description": "Deterministic AI Developer Workflow (ADW) Software Factory Engine for Pi Coding Agent",
+  "main": "index.ts",
+  "scripts": {
+    "test": "node --input-type=module test.ts"
+  },
+  "keywords": [
+    "pi-extension",
+    "adw",
+    "software-factory",
+    "workflow",
+    "piv-loop",
+    "indydevdan"
+  ],
+  "author": "Sam Lyndon",
+  "license": "MIT",
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  }
+}
