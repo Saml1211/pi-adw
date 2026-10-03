@@ -130,6 +130,7 @@ export function detectVerificationCommand(cwd: string): string | undefined {
 }
 
 export interface BoundedResult { code: number | null; out: string; timedOut: boolean; aborted: boolean; escaped: boolean }
+const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } };
 
 // Run a shell command in its own process group; on timeout/abort kill the WHOLE group (TERM, then
 // KILL after 2 s), so descendants can't outlive it and a timed-out command can never count as a pass.
@@ -154,7 +155,13 @@ export function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; sig
     child.stderr!.on("data", add);
     let timedOut = false, aborted = false, escaped = false, done = false;
     let killTimer: NodeJS.Timeout | undefined, settleTimer: NodeJS.Timeout | undefined;
-    const group = (sig: NodeJS.Signals) => { try { process.kill(-child.pid!, sig); } catch {} };
+    // A PGID is only reused once its group is empty, and the new group's leader has pid == pgid. So once
+    // our leader has been reaped, a live process with that pid means the id is someone else's: hands off.
+    const group = (sig: NodeJS.Signals) => {
+      const reaped = child.exitCode !== null || child.signalCode !== null;
+      if (reaped && pidAlive(child.pid!)) return;
+      try { process.kill(-child.pid!, sig); } catch {}
+    };
     const finish = (code: number | null) => {
       if (done) return;
       done = true;
@@ -221,11 +228,14 @@ export async function executeAdwPipeline(
     // Timeout and abort are tracked independently of the exit code: neither can ever be a pass.
     const r = await runBounded(verifyCmd, { cwd, timeoutMs: VERIFY_TIMEOUT_MS, signal: effectiveSignal });
     testStatus = r.code === 0 && !r.timedOut && !r.aborted ? "pass" : "fail";
+    const escaped = r.escaped ? "; a descendant escaped the group and may still be running" : "";
+    // header first, output tail after: a long log must not push the timeout/escape notice out of the report
+    const tail = r.out.slice(-1400);
     testOutput = r.timedOut
-      ? `Timed out after ${VERIFY_TIMEOUT_MS / 1000}s (process group killed${r.escaped ? "; a descendant escaped the group and may still run" : ""})\n${r.out}`
+      ? `Timed out after ${VERIFY_TIMEOUT_MS / 1000}s (process group killed${escaped})\n${tail}`
       : r.aborted
-      ? `Aborted (process group killed)\n${r.out}`
-      : r.out;
+      ? `Aborted (process group killed${escaped})\n${tail}`
+      : tail;
   }
 
   // 5. Harvest & Diff Summary (both staged and unstaged)
@@ -293,7 +303,7 @@ export async function executeAdwPipeline(
   sections.push(`\n**Diff Stat:**\n\`\`\`\n${diffSummary}\n\`\`\``);
 
   if (testStatus === "fail" && testOutput) {
-    sections.push(`\n**Test Failures:**\n\`\`\`\n${testOutput.slice(-1500)}\n\`\`\``);
+    sections.push(`\n**Test Failures:**\n\`\`\`\n${testOutput}\n\`\`\``);
   }
 
   return {

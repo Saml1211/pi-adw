@@ -113,9 +113,22 @@ console.log("\nALL TESTS PASSED! pi-adw is fully hardened.");
   const assert = (await import("node:assert")).default;
   const cp = await import("node:child_process");
   const t0 = Date.now();
-  const r = await runBounded("python3 -c 'import os,time; os.setsid(); time.sleep(8.8)' & true", { cwd: process.cwd(), timeoutMs: 200 });
-  try { cp.execFileSync("pkill", ["-f", "time.sleep\\(8.8\\)"]); } catch {}
-  assert.ok(Date.now() - t0 < 6500, "must settle despite an escaped pipe holder");
+  const os = await import("node:os"), fs = await import("node:fs"), path = await import("node:path");
+  const pidf = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "adw-esc-")), "pid");
+  const esc = `python3 -c 'import os,sys,time; os.setsid(); open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(8.8)' '${pidf}' & true`;
+  const killEscapee = () => { try { process.kill(Number(fs.readFileSync(pidf, "utf8")), "SIGKILL"); } catch {} }; // exact PID only
+  const r = await runBounded(esc, { cwd: process.cwd(), timeoutMs: 200 });
+  const took = Date.now() - t0;
+  killEscapee();
+  // the same escape on ABORT must be reported too, not just on timeout
+  const { executeAdwPipeline } = await import("./index.ts");
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 300);
+  const ab = await executeAdwPipeline("g", { verifyCommand: esc + "; sleep 9.1" }, process.cwd(), { getContextUsage: () => undefined, ui: { notify: () => {} } } as any, ac.signal);
+  killEscapee();
+  assert.equal(ab.testStatus, "fail");
+  assert.match(ab.reportMarkdown, /Aborted \(process group killed; a descendant escaped the group/, ab.reportMarkdown);
+  assert.ok(took < 6500, `must settle despite an escaped pipe holder (${took} ms)`);
   assert.ok(r.timedOut && r.escaped);
   console.log("✓ setsid escapee: verification settles and reports the escape");
 }
