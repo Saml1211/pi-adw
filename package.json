@@ -1,6 +1,6 @@
 {
   "name": "pi-adw",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Verification gate for Pi: Jev scope/risk, tests, diff stat, review readiness",
   "main": "index.ts",
   "scripts": {
